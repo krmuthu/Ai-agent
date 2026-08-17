@@ -1,0 +1,33 @@
+{
+  "name": "ai-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous ReAct coding agent with context compaction, strict Zod-validated tools and an OpenAI-compatible client.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "ai-agent": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "node src/index.ts",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "lint": "eslint .",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "openai": "^7.4.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^24.9.2",
+    "eslint": "^9.39.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.2"
+  }
+}
