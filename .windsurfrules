@@ -1,0 +1,97 @@
+# Windsurf rules — autonomous coding agent (Node 24 + TypeScript)
+
+These rules govern any change to this repository. Follow them literally; they
+encode invariants that keep the agent loop safe and debuggable.
+
+## Architecture map
+
+- `src/index.ts` — CLI entrypoint only: argument parsing, config assembly, event
+  logging, exit codes. No agent logic lives here.
+- `src/agent.ts` — the ReAct loop: LLM call → tool calls → tool results → repeat.
+  Owns the `MAX_ITERATIONS` safeguard and the context-overflow refusal path.
+- `src/context.ts` — token estimation and sliding-window compaction. Pure and
+  side-effect free; it must stay unit-testable without an LLM.
+- `src/tools.ts` — tool definitions and the `ToolRegistry`. Every tool is a Zod
+  schema plus an `execute` function.
+- `src/llm.ts` — OpenAI-compatible transport: retries, backoff, error typing.
+- `src/config.ts` — Zod-validated environment/CLI configuration. Single source
+  of truth for limits; never read `process.env` outside this module.
+- `src/prompt.ts` — system prompt and compaction prompt text.
+- `src/types.ts` — shared types. No runtime code.
+
+## Non-negotiable invariants
+
+1. **The loop always terminates.** Any new exit path must return an
+   `AgentResult` with an explicit `status`. Never `process.exit()` from
+   `agent.ts`.
+2. **Transcript validity.** Every `tool` message must directly follow the
+   assistant message whose `tool_call_id` it answers. Compaction, pruning and
+   retry logic must preserve that pairing — see the regression test in
+   `test/context.test.ts`.
+3. **The system prompt is never compacted away.** Compaction may only drop or
+   summarise messages after the system prefix.
+4. **Fail as data, not as exceptions.** Tool failures return
+   `{ ok: false, content }` so the model can self-correct. Only genuinely
+   unrecoverable transport errors may throw.
+5. **Workspace confinement.** All filesystem and shell access goes through
+   `resolveInWorkspace()`. Never accept an unresolved caller-supplied path.
+6. **Every shell command has a timeout** and is killed as a process group.
+7. **Context overflow refuses with the exact string**
+   `Error: Context limit exceeded. Pruning failed or task is too complex.`
+   (exported as `CONTEXT_LIMIT_MESSAGE`). Do not reword it; assert on the
+   constant in tests.
+
+## Adding a tool
+
+1. Define a `z.object({...})` schema with `.describe()` on every field — the
+   descriptions become the JSON Schema the model sees.
+2. Export a `ToolDefinition` whose `execute` validates with the same schema,
+   never with `as`.
+3. Return `{ heavy: true }` for bulky output (logs, file dumps) so compaction
+   can prune it first, and truncate to `context.maxOutputChars`.
+4. Register it in `builtinTools` (or pass a custom registry to `new Agent()`).
+5. Add a test covering the happy path and at least one rejection path.
+6. Never widen `ToolContext` with ambient globals; pass new capabilities
+   explicitly through it.
+
+## TypeScript rules
+
+- Strict mode with `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`
+  stays on. Do not relax `tsconfig.json` to make code compile.
+- No `any`, no non-null `!`, no `as` casts to silence the compiler. Narrow with
+  type guards instead; validate untrusted input with Zod.
+- `erasableSyntaxOnly` is enabled so Node can run TypeScript directly: no enums,
+  no parameter properties, no namespaces.
+- Relative imports use the `.ts` extension (`./tools.ts`); the compiler rewrites
+  them on emit.
+- Prefer `#private` class fields over `private`.
+- Import types with `import type`.
+
+## Runtime rules
+
+- Target Node 24 and use built-ins over dependencies: `node:util` `parseArgs`,
+  `node:test`, `fetch`, `AbortSignal.any`, `AbortSignal.timeout`,
+  `crypto.randomUUID`. Adding a dependency requires a comment justifying it.
+- All long-running work accepts an `AbortSignal` and honours it.
+- stdout carries the agent's answer only; diagnostics go to stderr via
+  `src/logger.ts`. `console.*` is banned by lint.
+- Never log secrets, full API keys, or raw `.env` contents.
+
+## Testing and checks
+
+- Before pushing: `npm run lint && npm run typecheck && npm test && npm run build`.
+- Unit tests must not hit the network or a real model: inject a scripted
+  `LlmClient` (see `test/agent.test.ts`).
+- Filesystem tests use `mkdtemp` under the OS temp dir, never the repo.
+- New loop behaviour (compaction, retries, iteration caps) requires a test that
+  fails without the change.
+
+## Model and provider guidance
+
+- Everything must work against any OpenAI-compatible endpoint; keep to the
+  chat-completions + function-calling subset and do not rely on
+  provider-specific fields.
+- Local open-weight models emit malformed tool arguments more often than hosted
+  ones — treat schema-validation failures as a normal, recoverable path.
+- Token counting is an estimate. Trust provider 400s over the estimator and keep
+  the emergency compaction path working.
