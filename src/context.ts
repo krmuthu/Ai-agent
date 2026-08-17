@@ -206,6 +206,10 @@ function assemble(
   return [...head, ...turns.flat()];
 }
 
+function isSummary(message: ChatMessage): boolean {
+  return message.role === 'system' && extractText(message).startsWith(SUMMARY_MARKER);
+}
+
 function splitSystemPrefix(messages: readonly ChatMessage[]): {
   prefix: ChatMessage[];
   rest: ChatMessage[];
@@ -215,10 +219,14 @@ function splitSystemPrefix(messages: readonly ChatMessage[]): {
   while (index < messages.length) {
     const message = messages[index];
     if (message === undefined) break;
+    // A summary from an earlier compaction is history, not prefix: leaving it
+    // in the prefix would exempt it from every later pass and let summaries
+    // accumulate one per compaction until they alone exceed the budget.
     const isPrefix =
-      message.role === 'system' ||
-      message.role === 'developer' ||
-      (message.role === 'user' && index === 0 && messages.length === 1);
+      !isSummary(message) &&
+      (message.role === 'system' ||
+        message.role === 'developer' ||
+        (message.role === 'user' && index === 0 && messages.length === 1));
     if (!isPrefix) break;
     prefix.push(message);
     index += 1;

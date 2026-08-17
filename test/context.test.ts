@@ -167,6 +167,24 @@ test('oversized tool-call arguments are pruned to valid JSON without orphaning r
   assert.ok(result.messages.some((message) => message.role === 'tool' && message.tool_call_id === 'call_big'));
 });
 
+test('repeated compactions keep exactly one history summary', async () => {
+  let messages: ChatMessage[] = [{ role: 'system', content: 'SYSTEM PROMPT' }];
+
+  for (let round = 0; round < 5; round += 1) {
+    for (let index = 0; index < 4; index += 1) messages.push(...turn(round * 4 + index, 3_000));
+    const result = await compactMessages(messages, { ...options, summarize: async () => 'S'.repeat(5_000) });
+    messages = result.messages;
+
+    assert.equal(messages[0]?.content, 'SYSTEM PROMPT');
+    const summaries = messages.filter(
+      (message) => message.role === 'system' && String(message.content).startsWith('[compacted-history]'),
+    );
+    assert.equal(summaries.length, 1);
+    assert.ok(countTokens(messages) <= budget);
+    assert.equal(result.withinBudget, true);
+  }
+});
+
 test('a system prompt bigger than the window reports withinBudget false and stays intact', async () => {
   const messages: ChatMessage[] = [
     { role: 'system', content: 'S'.repeat(20_000) },
