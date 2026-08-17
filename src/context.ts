@@ -5,6 +5,12 @@ const MESSAGE_OVERHEAD_TOKENS = 4;
 /** Average characters per token for code-heavy English text. */
 const CHARS_PER_TOKEN = 3.6;
 const SUMMARY_MARKER = '[compacted-history]';
+/** Share of the token budget the history summary may occupy. */
+const SUMMARY_BUDGET_FRACTION = 0.25;
+/** Smallest body a message is clamped to before the next, harsher pass. */
+const MIN_MESSAGE_CHARS = 200;
+/** First body size the final clamp tries. */
+const CLAMP_START_CHARS = 2_000;
 
 export interface CompactionOptions {
   /** Hard capacity of the model's context window, in tokens. */
@@ -25,6 +31,8 @@ export interface CompactionResult {
   readonly tokensAfter: number;
   /** Number of messages removed or replaced by the summary. */
   readonly droppedMessages: number;
+  /** False when even the harshest pruning could not reach the budget. */
+  readonly withinBudget: boolean;
 }
 
 /**
@@ -69,8 +77,9 @@ export function needsCompaction(
  * Keeps the system prompt and the last `keepRecentTurns` turns intact, replaces
  * everything older with a single synthesized summary, trims bulky tool output
  * from the older kept turns, and — only if the budget is still blown — evicts
- * the oldest kept turns one by one. Tool results always stay attached to the
- * assistant message that requested them, so the transcript stays API-valid.
+ * the oldest kept turns one by one and finally clamps the bodies of whatever
+ * survives. Tool results always stay attached to the assistant message that
+ * requested them, so the transcript stays API-valid.
  */
 export async function compactMessages(
   messages: readonly ChatMessage[],
@@ -85,8 +94,14 @@ export async function compactMessages(
   const recent = turns.slice(-keep);
   const stale = turns.slice(0, Math.max(0, turns.length - keep));
 
+  const summaryMaxChars = Math.max(
+    MIN_MESSAGE_CHARS,
+    Math.floor(budget * SUMMARY_BUDGET_FRACTION * CHARS_PER_TOKEN),
+  );
   const summary =
-    stale.length > 0 ? await summarizeTurns(stale.flat(), options) : undefined;
+    stale.length > 0
+      ? clip(await summarizeTurns(stale.flat(), options), summaryMaxChars)
+      : undefined;
 
   let kept = trimHeavyToolResults(recent, options.maxToolResultChars ?? 2_000);
   let assembled = assemble(prefix, summary, kept);
@@ -97,18 +112,86 @@ export async function compactMessages(
     assembled = assemble(prefix, summary, kept);
   }
 
-  // Last resort: aggressively truncate tool output in the surviving turn too.
+  // Aggressively truncate tool output in the surviving turn too.
   if (countTokens(assembled) > budget) {
     kept = trimHeavyToolResults(kept, 500, true);
     assembled = assemble(prefix, summary, kept);
   }
 
+  // Last resort: a single oversized body (a huge task, a long answer, bulky
+  // tool-call arguments) can still blow the window on its own. Clamp bodies
+  // outside the system prefix until they fit.
+  if (countTokens(assembled) > budget) {
+    assembled = clampToBudget(assembled, budget, prefix.length);
+  }
+
+  const tokensAfter = countTokens(assembled);
   return {
     messages: assembled,
     tokensBefore,
-    tokensAfter: countTokens(assembled),
+    tokensAfter,
     droppedMessages: Math.max(0, messages.length - assembled.length),
+    withinBudget: tokensAfter <= budget,
   };
+}
+
+/**
+ * Shrinks message bodies, largest pass first, until the transcript fits. The
+ * system prefix is never touched; message identity, roles and tool-call ids are
+ * preserved so the transcript stays API-valid.
+ */
+function clampToBudget(
+  messages: readonly ChatMessage[],
+  budget: number,
+  prefixLength: number,
+): ChatMessage[] {
+  const clamped = [...messages];
+  for (let maxChars = CLAMP_START_CHARS; maxChars >= MIN_MESSAGE_CHARS; maxChars = Math.floor(maxChars / 2)) {
+    for (let index = prefixLength; index < clamped.length; index += 1) {
+      if (countTokens(clamped) <= budget) return clamped;
+      const message = clamped[index];
+      if (message === undefined) continue;
+      clamped[index] = shrinkMessage(message, maxChars);
+    }
+  }
+  return clamped;
+}
+
+function shrinkMessage(message: ChatMessage, maxChars: number): ChatMessage {
+  if (message.role === 'tool') return truncateToolMessage(message, maxChars);
+
+  const text = extractText(message);
+  const content = text.length > maxChars ? prune(text, maxChars) : undefined;
+
+  if (message.role === 'assistant') {
+    const calls = message.tool_calls;
+    const shrunkCalls = calls?.map((call) =>
+      call.type === 'function' && call.function.arguments.length > maxChars
+        ? {
+            ...call,
+            function: {
+              ...call.function,
+              arguments: JSON.stringify({
+                pruned_by_compaction: `${call.function.arguments.length} characters of arguments omitted`,
+              }),
+            },
+          }
+        : call,
+    );
+    if (content === undefined && shrunkCalls === undefined) return message;
+    return {
+      ...message,
+      ...(content !== undefined ? { content } : {}),
+      ...(shrunkCalls !== undefined ? { tool_calls: shrunkCalls } : {}),
+    };
+  }
+
+  if (content === undefined) return message;
+  return { ...message, content };
+}
+
+function prune(text: string, maxChars: number): string {
+  return `${text.slice(0, maxChars)}\n… [${text.length - maxChars} characters pruned by compaction]`;
 }
 
 function assemble(
@@ -183,11 +266,7 @@ function truncateToolMessage(
 ): ChatMessage {
   const text = extractText(message);
   if (text.length <= maxChars) return message;
-  const omitted = text.length - maxChars;
-  return {
-    ...message,
-    content: `${text.slice(0, maxChars)}\n… [${omitted} characters of tool output pruned by compaction]`,
-  };
+  return { ...message, content: prune(text, maxChars) };
 }
 
 async function summarizeTurns(

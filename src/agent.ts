@@ -169,13 +169,17 @@ export class Agent {
     signal: AbortSignal,
     specs: ReturnType<ToolRegistry['specs']>,
   ): Promise<AssistantMessage | undefined> {
+    const before = countTokens(this.#messages);
+    // Target half of what we actually hold: the provider rejected the current
+    // transcript, so compacting against the configured window again — which our
+    // estimator already believes we fit into — would be a no-op.
     const emergency: CompactionOptions = {
       ...this.#compactionOptions(signal),
-      contextTokens: Math.floor(this.#config.contextTokens / 2),
+      contextTokens: Math.max(1, Math.floor(Math.min(this.#config.contextTokens, before) / 2)),
+      compactionThreshold: 1,
       keepRecentTurns: 1,
       maxToolResultChars: 500,
     };
-    const before = countTokens(this.#messages);
     const compacted = await compactMessages(this.#messages, emergency);
     if (compacted.tokensAfter >= before) return undefined;
 
