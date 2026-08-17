@@ -61,16 +61,24 @@ soon as the transcript reaches `AGENT_COMPACTION_THRESHOLD` (85%) of
 
 1. keep the system prompt and the last `AGENT_KEEP_RECENT_TURNS` turns verbatim;
 2. replace everything older with one synthesized summary — written by the model
-   itself, with a deterministic digest as fallback;
+   itself, with a deterministic digest as fallback, clipped to 25% of the budget
+   so a long history cannot overflow through its own summary;
 3. truncate bulky tool output in the older kept turns;
-4. if still over budget, evict the oldest kept turns, then hard-truncate.
+4. if still over budget, evict the oldest kept turns, then hard-truncate;
+5. as a last resort, clamp individual message bodies — including a single task,
+   answer or set of tool-call arguments that is larger than the whole window.
+   Clamped bodies end in `… [N characters pruned by compaction]`; oversized
+   tool-call arguments become `{"pruned_by_compaction": "…"}`, still valid JSON.
 
 Tool results always stay attached to the assistant message that requested them,
-so the compacted transcript remains a valid chat-completions payload.
+so the compacted transcript remains a valid chat-completions payload. When even
+step 5 cannot reach the budget (a system prompt bigger than the window, which is
+never compacted), `compactMessages` reports `withinBudget: false`.
 
 Because token counting is an estimate, the provider stays the source of truth:
-if the API returns a context-length `400`, the agent compacts hard against a
-halved budget and retries once. If that still overflows it stops and prints
+if the API returns a context-length `400`, the agent compacts hard against half
+of what the transcript currently holds and retries once. If that still overflows
+it stops and prints
 
 ```
 Error: Context limit exceeded. Pruning failed or task is too complex.

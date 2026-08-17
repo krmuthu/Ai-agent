@@ -123,6 +123,27 @@ test('an unrecoverable context overflow refuses gracefully', async () => {
   assert.ok(events.some((event) => event.type === 'error' && event.message === CONTEXT_LIMIT_MESSAGE));
 });
 
+test('a provider-side overflow recovers via emergency compaction', async () => {
+  const config = await testConfig({ contextTokens: 2_000, keepRecentTurns: 4 });
+  const overflow = new OpenAI.APIError(
+    400,
+    { error: { code: 'context_length_exceeded', message: "This model's maximum context length is 2000 tokens" } },
+    'context_length_exceeded',
+    undefined,
+  );
+  const llm = scriptedLlm([overflow, assistant('recovered')]);
+
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ config, llm, onEvent: (event) => events.push(event) });
+  const result = await agent.run('x'.repeat(40_000));
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.output, 'recovered');
+  assert.ok(events.some((event) => event.type === 'compaction' && event.after < event.before));
+  const task = result.messages.find((message) => message.role === 'user');
+  assert.match(String(task?.content), /characters pruned by compaction]$/);
+});
+
 test('execute_command captures output and enforces its timeout', async () => {
   const registry = new ToolRegistry();
   const context = {
